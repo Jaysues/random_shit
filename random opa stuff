@@ -1,0 +1,512 @@
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8senforcenetworkpolicies
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sEnforceNetworkPolicies
+      validation:
+        openAPIV3Schema:
+          properties:
+            parameters:
+              properties:
+                allowedExternalIPs:
+                  type: array
+                  items:
+                    type: string
+                allowPublicLoadBalancers:
+                  type: boolean
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8senforcenetworkpolicies
+
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "Namespace"
+          namespace := input.review.object
+          not has_default_deny_network_policy(namespace.metadata.name)
+          msg := sprintf("Namespace '%s' must have a default deny NetworkPolicy.", [namespace.metadata.name])
+        }
+
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "Service"
+          svc := input.review.object
+          svc.spec.externalIPs
+          externalIP := svc.spec.externalIPs[_]
+          not external_ip_allowed(externalIP)
+          msg := sprintf("Service '%s' uses disallowed external IP '%s'.", [svc.metadata.name, externalIP])
+        }
+
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "Service"
+          svc := input.review.object
+          svc.spec.type == "LoadBalancer"
+          not input.parameters.allowPublicLoadBalancers
+          msg := sprintf("Service '%s' of type LoadBalancer is not allowed to have a public IP.", [svc.metadata.name])
+        }
+
+        has_default_deny_network_policy(namespace) {
+          np := data.inventory.namespace_network_policies[namespace][_]
+          np.spec.policyTypes[_] == "Ingress"
+          np.spec.ingress == []
+        }
+
+        external_ip_allowed(ip) {
+          allowed := input.parameters.allowedExternalIPs
+          ip == allowed[_]
+        }
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sEnforceNetworkPolicies
+metadata:
+  name: enforce-network-policies
+spec:
+  enforcementAction: dryrun
+  match:
+    - kinds:
+        - apiGroups: [""]
+          kinds: ["Namespace", "Service"]
+  parameters:
+    allowedExternalIPs:
+      - "192.168.1.10"
+      - "192.168.1.11"
+    allowPublicLoadBalancers: false
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8senforcekubernetesbestpractices
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sEnforceKubernetesBestPractices
+      validation:
+        openAPIV3Schema:
+          properties:
+            parameters:
+              properties:
+                requiredLabels:
+                  type: array
+                  items:
+                    type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8senforcekubernetesbestpractices
+
+        violation[{"msg": msg}] {
+          input.review.object.metadata.namespace == "default"
+          msg := sprintf("Resource '%s' must not be created in the 'default' namespace.", [input.review.object.metadata.name])
+        }
+
+        violation[{"msg": msg}] {
+          labels := input.review.object.metadata.labels
+          required := input.parameters.requiredLabels
+          missing := [label | label := required[_]; not labels[label]]
+          count(missing) > 0
+          msg := sprintf("Resource '%s' is missing required labels: %v.", [input.review.object.metadata.name, missing])
+        }
+
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "Pod"
+          not has_controller_owner_ref(input.review.object)
+          msg := sprintf("Pod '%s' must be managed by a controller.", [input.review.object.metadata.name])
+        }
+
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "RoleBinding"
+          subjects := input.review.object.subjects[_]
+          subjects.kind == "User"
+          subjects.name == "cluster-admin"
+          msg := sprintf("RoleBinding '%s' must not grant 'cluster-admin' privileges.", [input.review.object.metadata.name])
+        }
+
+        violation[{"msg": msg}] {
+          (input.review.kind.kind == "Role" or input.review.kind.kind == "ClusterRole")
+          rules := input.review.object.rules[_]
+          (rules.verbs[_] == "*" or rules.resources[_] == "*")
+          msg := sprintf("Role '%s' must not use wildcard in verbs or resources.", [input.review.object.metadata.name])
+        }
+
+        has_controller_owner_ref(obj) {
+          owner := obj.metadata.ownerReferences[_]
+          owner.controller == true
+        }
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sEnforceKubernetesBestPractices
+metadata:
+  name: enforce-kubernetes-best-practices
+spec:
+  enforcementAction: dryrun
+  match:
+    - kinds:
+        - apiGroups: [""]
+          kinds: ["Pod", "Deployment", "Service", "RoleBinding", "Role", "ClusterRole"]
+  parameters:
+    requiredLabels:
+      - "app"
+      - "environment"
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8senforceallowedvolumetypes
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sEnforceAllowedVolumeTypes
+      validation:
+        openAPIV3Schema:
+          properties:
+            parameters:
+              properties:
+                allowedVolumeTypes:
+                  type: array
+                  items:
+                    type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8senforceallowedvolumetypes
+
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "Pod"
+          volumes := input.review.object.spec.volumes[_]
+          volType := get_volume_type(volumes)
+          not volTypeAllowed(volType)
+          msg := sprintf("Pod '%s' uses disallowed volume type '%s'.", [input.review.object.metadata.name, volType])
+        }
+
+        get_volume_type(volume) = volType {
+          # Exclude 'name' key to find the volume type
+          volType := object.get(object.remove(volume, ["name"]), "key", "")
+        }
+
+        volTypeAllowed(volType) {
+          allowed := {t | t := input.parameters.allowedVolumeTypes[_]}
+          volType == allowed[_]
+        }
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sEnforceAllowedVolumeTypes
+metadata:
+  name: enforce-allowed-volume-types
+spec:
+  enforcementAction: dryrun
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+  parameters:
+    allowedVolumeTypes:
+      - "configMap"
+      - "secret"
+      - "persistentVolumeClaim"
+      - "emptyDir"
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srestrictunsafesysctls
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRestrictUnsafeSysctls
+      validation:
+        openAPIV3Schema:
+          properties:
+            parameters:
+              properties:
+                allowedSysctls:
+                  type: array
+                  items:
+                    type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srestrictunsafesysctls
+
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "Pod"
+          sysctls := input.review.object.spec.securityContext.sysctls[_]
+          not sysctlAllowed(sysctls.name)
+          msg := sprintf("Pod '%s' uses disallowed sysctl '%s'.", [input.review.object.metadata.name, sysctls.name])
+        }
+
+        sysctlAllowed(name) {
+          allowed := {s | s := input.parameters.allowedSysctls[_]}
+          name == allowed[_]
+        }
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRestrictUnsafeSysctls
+metadata:
+  name: restrict-unsafe-sysctls
+spec:
+  enforcementAction: dryrun
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+  parameters:
+    allowedSysctls:
+      - "net.ipv4.tcp_syncookies"
+      - "net.ipv4.ip_local_port_range"
+      - "net.ipv4.tcp_tw_reuse"
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8senforcegitopsbestpractices
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sEnforceGitOpsBestPractices
+      validation:
+        openAPIV3Schema:
+          properties:
+            parameters:
+              properties:
+                allowedAuthMethods:
+                  type: array
+                  items:
+                    type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8senforcegitopsbestpractices
+
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "GitRepository"
+          authMethod := input.review.object.spec.secretRef.name
+          not authMethodAllowed(authMethod)
+          msg := sprintf("GitRepository '%s' uses disallowed authentication method.", [input.review.object.metadata.name])
+        }
+
+        authMethodAllowed(method) {
+          allowed := {a | a := input.parameters.allowedAuthMethods[_]}
+          method == allowed[_]
+        }
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sEnforceGitOpsBestPractices
+metadata:
+  name: enforce-gitops-best-practices
+spec:
+  enforcementAction: dryrun
+  match:
+    kinds:
+      - apiGroups: ["source.toolkit.fluxcd.io"]
+        kinds: ["GitRepository"]
+  parameters:
+    allowedAuthMethods:
+      - "ssh-key"
+      - "https-token"
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8senforceimageintegrity
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sEnforceImageIntegrity
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8senforceimageintegrity
+
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "Pod"
+          container := input.review.object.spec.containers[_]
+          not imageVerified(container.image)
+          msg := sprintf("Container '%s' in Pod '%s' uses an image '%s' that is not signed or verified.", [container.name, input.review.object.metadata.name, container.image])
+        }
+
+        imageVerified(image) {
+          # Placeholder logic for image verification
+          # In practice, integrate with image signing and verification tools
+          has_prefix(image, "verified.registry.com/")
+        }
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sEnforceImageIntegrity
+metadata:
+  name: enforce-image-integrity
+spec:
+  enforcementAction: dryrun
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8senforcewindowssecurity
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sEnforceWindowsSecurity
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8senforcewindowssecurity
+
+        violation[{"msg": msg}] {
+          is_windows_pod
+          container := input.review.object.spec.containers[_]
+          sc := container.securityContext
+          sc.windowsOptions.runAsUserName == "ContainerAdministrator"
+          msg := sprintf("Windows container '%s' in Pod '%s' must not run as 'ContainerAdministrator'.", [container.name, input.review.object.metadata.name])
+        }
+
+        is_windows_pod {
+          input.review.object.spec.nodeSelector["kubernetes.io/os"] == "windows"
+        }
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sEnforceWindowsSecurity
+metadata:
+  name: enforce-windows-security
+spec:
+  enforcementAction: dryrun
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8senforceingresspolicies
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sEnforceIngressPolicies
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8senforceingresspolicies
+
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "Ingress"
+          ingress := input.review.object
+          not has_tls(ingress)
+          msg := sprintf("Ingress '%s' must have TLS configured.", [ingress.metadata.name])
+        }
+
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "Ingress"
+          ingress := input.review.object
+          host := ingress.spec.rules[_].host
+          conflicting_ingress := data.inventory.ingresses[_]
+          conflicting_host := conflicting_ingress.spec.rules[_].host
+          conflicting_ingress.metadata.name != ingress.metadata.name
+          host == conflicting_host
+          msg := sprintf("Ingress '%s' host '%s' conflicts with existing Ingress '%s'.", [ingress.metadata.name, host, conflicting_ingress.metadata.name])
+        }
+
+        has_tls(ingress) {
+          ingress.spec.tls[_]
+        }
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sEnforceIngressPolicies
+metadata:
+  name: enforce-ingress-policies
+spec:
+  enforcementAction: dryrun
+  match:
+    kinds:
+      - apiGroups: ["networking.k8s.io"]
+        kinds: ["Ingress"]
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8senforceuseofcsidrivers
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sEnforceUseOfCSIDrivers
+      validation:
+        openAPIV3Schema:
+          properties:
+            parameters:
+              properties:
+                allowedCSIDrivers:
+                  type: array
+                  items:
+                    type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8senforceuseofcsidrivers
+
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "PersistentVolumeClaim"
+          pvc := input.review.object
+          sc_name := pvc.spec.storageClassName
+          sc := data.inventory.storageclasses[sc_name]
+          driver := sc.provisioner
+          not driverAllowed(driver)
+          msg := sprintf("PVC '%s' uses storage class '%s' with disallowed CSI driver '%s'.", [pvc.metadata.name, sc_name, driver])
+        }
+
+        driverAllowed(driver) {
+          allowed := {d | d := input.parameters.allowedCSIDrivers[_]}
+          driver == allowed[_]
+        }
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sEnforceUseOfCSIDrivers
+metadata:
+  name: enforce-use-of-csi-drivers
+spec:
+  enforcementAction: dryrun
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["PersistentVolumeClaim"]
+  parameters:
+    allowedCSIDrivers:
+      - "ebs.csi.aws.com"
+      - "efs.csi.aws.com"
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiremutationannotations
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequireMutationAnnotations
+      validation:
+        openAPIV3Schema:
+          properties:
+            parameters:
+              properties:
+                requiredAnnotations:
+                  type: array
+                  items:
+                    type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiremutationannotations
+
+        violation[{"msg": msg}] {
+          annotations := input.review.object.metadata.annotations
+          required := input.parameters.requiredAnnotations
+          missing := [ann | ann := required[_]; not annotations[ann]]
+          count(missing) > 0
+          msg := sprintf("Resource '%s' is missing required annotations: %v.", [input.review.object.metadata.name, missing])
+        }
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: K8sRequireMutationAnnotations
+metadata:
+  name: require-mutation-annotations
+spec:
+  enforcementAction: dryrun
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod", "Deployment", "Service"]
+  parameters:
+    requiredAnnotations:
+      - "mutations.gatekeeper.sh/last-applied"
